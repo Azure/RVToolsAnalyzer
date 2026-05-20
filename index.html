@@ -1,4 +1,4 @@
-<!-- RVTools Analyzer v4.3 · Built 2026-05-19 21:47 · © Shaun Jacob -->
+<!-- RVTools Analyzer v4.3 · Built 2026-05-20 01:37 · © Shaun Jacob -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4482,6 +4482,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       groupBy: 'cluster',
       family: 'all',
       selectionFilter: 'all',
+      workloadPick: [],          // array of selected workload labels (e.g. ['File Server (inferred)', 'Unclassified'])
       multiDiskOnly: false,
       poweredOffOnly: false,
       poweredOnOnly: false,
@@ -4522,6 +4523,10 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       merged.diskOverrides = saved.diskOverrides || {};
       merged.expanded = saved.expanded || {};
       merged.collapsedGroups = saved.collapsedGroups || {};
+      // workloadPick must always be an array of strings; coerce any stale shape back to [].
+      merged.workloadPick = Array.isArray(saved.workloadPick)
+        ? saved.workloadPick.filter(v => typeof v === 'string')
+        : [];
       return merged;
     } catch (_) { return defaults; }
   }
@@ -4943,6 +4948,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       const vmComputeNoAhubGross = (sku && settings.hybridBenefit && /windows/i.test(String(vm.os || '')))
         ? priceForSku(sku, Object.assign({}, settings, { hybridBenefit: false }), vm.os)
         : vmComputeGross;
+      const vmAhubSaving = Math.max(0, (vmComputeNoAhubGross - vmComputeGross) * compMul);
 
       const diskRows = vm.disks.map((d, idx) => {
         const diskKey = vm.key + '|' + d.id + '|' + idx;
@@ -4975,10 +4981,11 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       }
 
       // Compute, AHUB savings, vCPU/RAM counters require a resolved SKU.
+      let vmReviewMonthly = 0;
       if (include && sku) {
         included++;
         computeCost += vmCompute;
-        ahubSavings += Math.max(0, (vmComputeNoAhubGross - vmComputeGross) * compMul);
+        ahubSavings += vmAhubSaving;
         vcpu += vm.cpus;
         ram += vm.ramGB;
       } else if (include && !sku) {
@@ -4993,7 +5000,10 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
           const fallback = VM_SKUS
             .filter(s => s.vcpu >= vm.cpus && s.ramGB >= vm.ramGB)
             .sort((a, b) => priceForSku(a, settings, vm.os) - priceForSku(b, settings, vm.os))[0];
-          if (fallback) reviewIncludedCompute += priceForSku(fallback, settings, vm.os) * compMul;
+          if (fallback) {
+            vmReviewMonthly = priceForSku(fallback, settings, vm.os) * compMul;
+            reviewIncludedCompute += vmReviewMonthly;
+          }
         }
       } else {
         excluded++;
@@ -5005,6 +5015,10 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
         computeMonthly: include ? vmCompute : 0,
         storageMonthly: include ? vmStorage : 0,
         totalMonthly: include ? vmCompute + vmStorage : 0,
+        // Per-row fields used to reconstruct totals when the workload picker scopes the dataset.
+        ahubSaving: (include && sku) ? vmAhubSaving : 0,
+        reviewMonthly: vmReviewMonthly,
+        provStorageMonthly: include ? vmProvStorage : 0,
         // Gross (always-computed) values for stable sorting — using these for sort means
         // ticking/unticking a VM does NOT change its row position, so the user doesn't lose
         // their place in the list when toggling include.
@@ -5080,9 +5094,116 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     return n;
   }
 
+  // ───────── Workload picker support ─────────
+
+  // Synthetic label for VMs the classifier could not categorise (blank label or
+  // explicit "General / Unclassified" group). Surfaced as a pickable bucket so
+  // users can isolate / exclude unknown workloads.
+  const UNCLASSIFIED_LABEL = 'Unclassified';
+
+  // Map a row's raw `workload` to the label used by the picker.
+  function workloadLabelFor(row) {
+    const w = String((row && row.workload) || '').trim();
+    if (!w || /^general\s*\/\s*unclassified$/i.test(w)) return UNCLASSIFIED_LABEL;
+    return w;
+  }
+
+  // Sorted, deduped list of workload labels actually present in the dataset.
+  // Optionally returns counts (label → number of rows) when withCounts is true.
+  function workloadLabelsFromRows(rows, withCounts) {
+    const counts = new Map();
+    for (const r of (rows || [])) {
+      const label = workloadLabelFor(r);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    // Pin "Unclassified" to the bottom; everything else alphabetic.
+    const labels = Array.from(counts.keys()).sort((a, b) => {
+      if (a === UNCLASSIFIED_LABEL) return 1;
+      if (b === UNCLASSIFIED_LABEL) return -1;
+      return a.localeCompare(b);
+    });
+    if (withCounts) return labels.map(l => ({ label: l, count: counts.get(l) || 0 }));
+    return labels;
+  }
+
+  // Re-derive a `totals` object identical in shape to compute()'s output but constrained
+  // to the supplied subset of rows. Used to rescope the cost panel / donut / footer when
+  // the workload picker is active. Per-row fields (`computeMonthly`, `ahubSaving` …) are
+  // populated in compute() — see the `rows.push(...)` block above.
+  //
+  // Estate-wide diagnostic counters (unknownOs, conditionalOs) are inherited from the
+  // base totals because they describe the whole dataset's readiness, not the picked scope.
+  function scopedTotalsFromRows(rows, baseTotals) {
+    const t = {
+      included: 0, excluded: 0, vcpu: 0, ramGB: 0, diskCount: 0,
+      review: 0, reviewIncluded: 0, reviewIncludedCompute: 0,
+      unknownOs: (baseTotals && baseTotals.unknownOs) || 0,
+      conditionalOs: (baseTotals && baseTotals.conditionalOs) || 0,
+      consumedGB: 0, provisionedGB: 0, billedGB: 0,
+      computeCost: 0, storageCost: 0, defenderCost: 0, total: 0,
+      ahubSavings: 0,
+      grossCompute: 0, grossStorage: 0,
+      annual: 0,
+      storageSavings: 0,
+      confidenceLow: 0, confidenceHigh: 0,
+    };
+    let ramAcc = 0;
+    let provStorageAcc = 0;
+    for (const r of rows) {
+      if (r.include) {
+        t.storageCost += r.storageMonthly || 0;
+        provStorageAcc += r.provStorageMonthly || 0;
+        t.diskCount += (r.diskRows && r.diskRows.length) || 0;
+        for (const d of (r.diskRows || [])) {
+          t.consumedGB += +d.inUseGB || 0;
+          t.provisionedGB += +d.provisionedGB || 0;
+          t.billedGB += +d.sizeGB || 0;
+        }
+      }
+      if (r.include && r.sku) {
+        t.included++;
+        t.computeCost += r.computeMonthly || 0;
+        t.ahubSavings += r.ahubSaving || 0;
+        t.vcpu += r.cpus || 0;
+        ramAcc += r.ramGB || 0;
+      } else if (r.include && !r.sku) {
+        t.reviewIncluded++;
+        t.review++;
+        t.reviewIncludedCompute += r.reviewMonthly || 0;
+      } else {
+        t.excluded++;
+        if (!r.sku) t.review++;
+      }
+    }
+    t.ramGB = Math.round(ramAcc);
+    // Defender is per-included-VM at base rate; rescale by scoped included count.
+    if (baseTotals && baseTotals.included > 0) {
+      const perVm = (baseTotals.defenderCost || 0) / baseTotals.included;
+      t.defenderCost = perVm * t.included;
+    } else {
+      t.defenderCost = 0;
+    }
+    t.total = t.computeCost + t.storageCost + t.defenderCost;
+    // grossCompute/grossStorage in compute() back out the discount multipliers. We don't
+    // have those multipliers here, so derive the same ratio from baseTotals if available.
+    const compRatio = (baseTotals && baseTotals.computeCost > 0)
+      ? (baseTotals.grossCompute / baseTotals.computeCost) : 1;
+    const stoRatio = (baseTotals && baseTotals.storageCost > 0)
+      ? (baseTotals.grossStorage / baseTotals.storageCost) : 1;
+    t.grossCompute = t.computeCost * compRatio;
+    t.grossStorage = t.storageCost * stoRatio;
+    t.annual = t.total * 12;
+    t.storageSavings = Math.max(0, provStorageAcc - t.storageCost);
+    t.confidenceLow = t.total * 0.85;
+    t.confidenceHigh = t.total * 1.15;
+    return t;
+  }
+
   function filteredRows(rows) {
     if (_memoFilteredRows && _memoFilteredRows.input === rows) return _memoFilteredRows.out;
     const q = String(state.filter || '').toLowerCase().trim();
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = picks.length ? new Set(picks) : null;
     const out = rows.filter(r => {
       if (state.multiDiskOnly && r.diskRows.length < 2) return false;
       if (state.poweredOffOnly && /on/i.test(String(r.powerState || ''))) return false;
@@ -5092,6 +5213,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       if (state.family !== 'all' && r.family !== state.family) return false;
       if (state.selectionFilter === 'included' && !r.include) return false;
       if (state.selectionFilter === 'excluded' && r.include) return false;
+      if (pickSet && !pickSet.has(workloadLabelFor(r))) return false;
       if (!q) return true;
       return [r.name, r.os, r.cluster, r.folder, r.host, r.datastore, r.workload].some(v => String(v || '').toLowerCase().includes(q));
     }).sort((a, b) => {
@@ -5197,6 +5319,95 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       if (e.key !== 'Escape') return;
       const dd = document.getElementById('rv-fam-dropdown');
       if (dd && dd.open) dd.open = false;
+    });
+  }
+
+  // ───────── Workload picker dropdown ─────────
+
+  // Build the toolbar's Workload <details> dropdown: checkbox list of every
+  // workload label present in the dataset (counts shown), with a search box at
+  // the top for fast type-to-filter, and Select all / Clear actions. Returns
+  // empty string when the dataset has no workloads to filter (no workbook).
+  function workloadDropdownHtml(allRows) {
+    _ensureWorkloadOutsideClose();
+    const items = workloadLabelsFromRows(allRows, true);
+    if (!items.length) return '';
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = new Set(picks);
+    const onCount = items.filter(it => pickSet.has(it.label)).length;
+    const summary = onCount === 0
+      ? 'All workloads'
+      : onCount === 1
+        ? picks[0]
+        : onCount <= 2
+          ? picks.slice(0, 2).join(', ')
+          : `${picks.slice(0, 2).join(', ')} +${picks.length - 2}`;
+    const search = String(workloadPickerSearch || '').toLowerCase();
+    const rowsHtml = items.map(it => {
+      const on = pickSet.has(it.label);
+      const matches = !search || it.label.toLowerCase().includes(search);
+      const hidden = matches ? '' : ' style="display:none;"';
+      return `<label class="rv-fam-row" data-rv-wl-row="${esc(it.label.toLowerCase())}"${hidden}>
+        <input type="checkbox" ${on ? 'checked' : ''} onchange="_rvNativeWorkloadToggle(${js(it.label)}, this.checked)" />
+        <span class="rv-fam-row-label">${esc(it.label)}</span>
+        <span class="rv-fam-row-note">${it.count} VM${it.count === 1 ? '' : 's'}</span>
+      </label>`;
+    }).join('');
+    return `<details class="rv-fam-dropdown" id="rv-native-workload-dropdown"${workloadDropdownOpen ? ' open' : ''} ontoggle="_rvNativeWorkloadOpenState(this.open)">
+      <summary class="rv-fam-summary" aria-label="Filter by workload">
+        <span class="rv-fam-summary-text">${esc(summary)}</span>
+        <span class="rv-fam-summary-caret">▾</span>
+      </summary>
+      <div class="rv-fam-menu" style="min-width:18rem;">
+        <div class="rv-fam-menu-actions" style="padding-bottom:0.4rem;">
+          <input type="text" id="rv-native-workload-search" class="rv-ctrl-input" placeholder="Type to filter…" value="${esc(workloadPickerSearch || '')}" oninput="_rvNativeWorkloadSearch(this.value)" style="width:100%;" />
+        </div>
+        <div class="rv-fam-menu-actions">
+          <button type="button" class="rv-native-link" onclick="_rvNativeWorkloadSelectAll()">Select all</button>
+          <span class="rv-soft">·</span>
+          <button type="button" class="rv-native-link" onclick="_rvNativeWorkloadClear()">Clear</button>
+        </div>
+        <div class="rv-native-workload-rows" style="max-height:18rem; overflow:auto;">${rowsHtml}</div>
+      </div>
+    </details>`;
+  }
+
+  // Chip strip rendered below the toolbar's primary row when one or more
+  // workloads are picked. Lets the user remove individual picks (×) or clear all
+  // without re-opening the dropdown.
+  function workloadChipsHtml() {
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    if (!picks.length) return '';
+    const chips = picks.map(p =>
+      `<button type="button" class="rv-filter-preset rv-filter-preset--active" onclick="_rvNativeWorkloadRemove(${js(p)})" title="Remove ${esc(p)} from filter">${esc(p)} ×</button>`
+    ).join('');
+    return `<div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
+      <span class="rv-table-toolbar-label">Workload</span>
+      ${chips}
+      ${picks.length >= 2 ? `<button type="button" class="rv-native-link" onclick="_rvNativeWorkloadClear()" title="Clear all picked workloads">Clear all</button>` : ''}
+    </div>`;
+  }
+
+  // Picker open-state and search query live outside `state` because they're
+  // pure UI ephemera (no need to persist them or recompute the table when they
+  // change). Open state survives re-renders so the dropdown doesn't snap shut
+  // every time the user toggles a checkbox.
+  let workloadDropdownOpen = false;
+  let workloadPickerSearch = '';
+
+  let _workloadOutsideInstalled = false;
+  function _ensureWorkloadOutsideClose() {
+    if (_workloadOutsideInstalled || typeof document === 'undefined') return;
+    _workloadOutsideInstalled = true;
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('rv-native-workload-dropdown');
+      if (!dd || !dd.open) return;
+      if (!dd.contains(e.target)) { dd.open = false; workloadDropdownOpen = false; }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const dd = document.getElementById('rv-native-workload-dropdown');
+      if (dd && dd.open) { dd.open = false; workloadDropdownOpen = false; }
     });
   }
 
@@ -5433,10 +5644,19 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     const defenderPct = total > 0 ? Math.max(0, 100 - computePct - storagePct) : 0;
     const compDisc = +s.computeDiscount || 0;
     const stoDisc = +s.storageDiscount || 0;
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const scopedChips = picks.length
+      ? `<div class="rv-callout-info rv-native-cost-scope" style="margin-bottom:0.6rem; padding:0.45rem 0.7rem; font-size: var(--rv-fs-xs); display:flex; gap:0.4rem; flex-wrap:wrap; align-items:center;">
+          <span class="rv-soft">Cost scoped to:</span>
+          ${picks.map(p => `<button type="button" class="rv-filter-preset rv-filter-preset--active" onclick="_rvNativeWorkloadRemove(${js(p)})" title="Remove ${esc(p)} from filter">${esc(p)} ×</button>`).join('')}
+          ${picks.length >= 2 ? `<button type="button" class="rv-native-link" onclick="_rvNativeWorkloadClear()" title="Clear all picked workloads">Clear all</button>` : ''}
+        </div>`
+      : '';
     return `<div class="rv-sizing-layout mb-4">
       <div class="rv-sizing-left">
         <div class="rv-step-card" style="height:100%;">
-          <div class="rv-step-label">3 · Cost Summary</div>
+          <div class="rv-step-label">3 · Cost Summary${picks.length ? ` <span class="rv-soft" style="font-weight:normal;">(scoped)</span>` : ''}</div>
+          ${scopedChips}
           <div class="rv-native-cost-grid">
             <div class="rv-native-cost-row"><span>Compute${compDisc ? ` <span class="rv-soft">(−${compDisc}%)</span>` : ''}</span><strong>${fmt(t.computeCost)}/mo</strong></div>
             <div class="rv-native-cost-row"><span>Storage${stoDisc ? ` <span class="rv-soft">(−${stoDisc}%)</span>` : ''}</span><strong>${fmt(t.storageCost)}/mo</strong></div>
@@ -5493,6 +5713,8 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
   function filterHtml(rows) {
     const allRows = (lastResult && lastResult.rows) ? lastResult.rows : rows;
     const modCount = totalModifiedCount(allRows);
+    const wlPicker = workloadDropdownHtml(allRows);
+    const wlChips = workloadChipsHtml();
     return `<div class="rv-native-controls rv-table-toolbar" style="margin-bottom:0.65rem; display:block;">
       <div class="rv-table-toolbar-row">
         <span class="rv-table-toolbar-label">Find</span>
@@ -5504,6 +5726,10 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
             ${[['cluster','Cluster'],['host','Host'],['folder','Folder'],['os','OS'],['family','Family'],['diskCount','Disk count'],['datastore','Datastore'],['none','None']].map(o => `<option value="${o[0]}" ${state.groupBy === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}
           </select>
         </label>
+        ${wlPicker ? `<label class="text-xs rv-soft" style="display:flex;align-items:center;gap:0.35rem;">
+          <strong>Workload</strong>
+          ${wlPicker}
+        </label>` : ''}
         <button type="button" class="rv-filter-preset" onclick="_rvNativeAllGroups(false)" title="Expand every group">⤓ Expand all</button>
         <button type="button" class="rv-filter-preset" onclick="_rvNativeAllGroups(true)" title="Collapse every group">⤒ Collapse all</button>
         <span class="rv-table-toolbar-sep"></span>
@@ -5520,6 +5746,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
           </select>
         </label>
       </div>
+      ${wlChips}
       <div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
         <span class="rv-table-toolbar-label">Filter</span>
         <button type="button" class="rv-filter-preset ${state.multiDiskOnly ? 'rv-filter-preset--active' : ''}" onclick="_rvNativeQuick('multiDiskOnly', ${!state.multiDiskOnly})">Multi-disk only</button>
@@ -5830,6 +6057,16 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     captureFocus();
     lastResult = result;
     window._rvAzureNativeLast = result;
+    // Expose a small read-only accessor for cross-tab consumers (cost-comparison)
+    // so they can opt-in to the workload-scoped totals without poking internals.
+    const _scopedTotals = (Array.isArray(state.workloadPick) && state.workloadPick.length)
+      ? scopedTotalsFromRows(filteredRows(result.rows), result.totals)
+      : null;
+    window.rvAzureNative = {
+      getLastResult: () => lastResult,
+      getScopedTotals: () => _scopedTotals,
+      getWorkloadPick: () => (Array.isArray(state.workloadPick) ? state.workloadPick.slice() : []),
+    };
     if (window.renderCostComparison && document.getElementById('tab-cost-comparison')) {
       window.renderCostComparison();
     }
@@ -5846,23 +6083,32 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     appendSummaryCard(result);
 
     const filtered = filteredRows(result.rows);
+    // Build a scoped result when the workload picker is active so the cost panel,
+    // donut, and footer reflect just the picked workloads. Table + OS readiness
+    // banner keep the un-scoped result (table already shows `filtered`; banner is
+    // estate-wide diagnostic info).
+    const scopedResult = _scopedTotals ? Object.assign({}, result, { totals: _scopedTotals }) : result;
+    const footerTotals = _scopedTotals || result.totals;
+    const scopeNote = _scopedTotals
+      ? ` · scoped to ${state.workloadPick.length} workload${state.workloadPick.length === 1 ? '' : 's'}`
+      : '';
     el.innerHTML = `
       ${controlsHtml(result)}
       ${demandHtml(result)}
-      ${costHtml(result)}
+      ${costHtml(scopedResult)}
       <div class="rv-step-card mb-3">
         <div class="rv-step-label">5 · VM Details</div>
         ${osReadinessBannerHtml(result)}
         ${filterHtml(filtered)}
         ${tableHtml(result)}
       </div>
-      <div class="rv-native-footer">Last calculated ${esc(state.lastCalculated || '—')} · ${result.totals.included.toLocaleString()} included VMs · ${result.totals.diskCount.toLocaleString()} disks</div>
+      <div class="rv-native-footer">Last calculated ${esc(state.lastCalculated || '—')} · ${footerTotals.included.toLocaleString()} included VMs · ${footerTotals.diskCount.toLocaleString()} disks${scopeNote}</div>
     `;
     restoreFocus();
     restoreScrollAnchor();
     // apply indeterminate state on the master checkbox
     el.querySelectorAll('input[type="checkbox"][data-indeterminate]').forEach(cb => { cb.indeterminate = true; });
-    drawDonut(result);
+    drawDonut(scopedResult);
   }
 
   let _nativeDonut = null;
@@ -5968,6 +6214,61 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     if (value && key === 'poweredOffOnly') state.poweredOnOnly  = false;
     saveState();
     scheduleRecompute();
+  };
+
+  // ───────── Workload picker handlers ─────────
+
+  function _wlEnsureArray() {
+    if (!Array.isArray(state.workloadPick)) state.workloadPick = [];
+    return state.workloadPick;
+  }
+  // Toggle a single workload label on/off in state.workloadPick. Wired to each
+  // checkbox row in the dropdown.
+  window._rvNativeWorkloadToggle = function (label, checked) {
+    if (typeof label !== 'string') return;
+    const picks = _wlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (checked && idx === -1) picks.push(label);
+    else if (!checked && idx !== -1) picks.splice(idx, 1);
+    saveState();
+    scheduleRecompute();
+  };
+  // Remove a single workload (used by the chip × buttons and the scoped indicator chips).
+  window._rvNativeWorkloadRemove = function (label) {
+    const picks = _wlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (idx === -1) return;
+    picks.splice(idx, 1);
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvNativeWorkloadClear = function () {
+    state.workloadPick = [];
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvNativeWorkloadSelectAll = function () {
+    if (!lastResult) return;
+    state.workloadPick = workloadLabelsFromRows(lastResult.rows);
+    saveState();
+    scheduleRecompute();
+  };
+  // Pure DOM filter inside the open dropdown — no state mutation and no
+  // recompute, so the picker stays responsive while typing.
+  window._rvNativeWorkloadSearch = function (query) {
+    workloadPickerSearch = String(query || '');
+    const q = workloadPickerSearch.toLowerCase();
+    const dd = document.getElementById('rv-native-workload-dropdown');
+    if (!dd) return;
+    dd.querySelectorAll('[data-rv-wl-row]').forEach(el => {
+      const label = el.getAttribute('data-rv-wl-row') || '';
+      el.style.display = (!q || label.includes(q)) ? '' : 'none';
+    });
+  };
+  // Remember whether the picker is open across re-renders so toggling a
+  // checkbox doesn't snap the panel shut.
+  window._rvNativeWorkloadOpenState = function (open) {
+    workloadDropdownOpen = !!open;
   };
   window._rvNativeSortBy = function (key) {
     const stringKeys = ['name', 'os', 'family', 'sku'];
@@ -6149,7 +6450,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     filter: '',
     groupBy: 'cluster',          // cluster | folder | os | workload | datastore | none
     selectionFilter: 'all',      // all | included | excluded
-    workloadFilter: 'all',       // 'all' | one of the workloadGroup values | '(unclassified)'
+    workloadPick: [],            // multi-pick array; empty = all workloads (OR semantics)
     largeOnly: true,
     largeThresholdGB: LARGE_THRESHOLD_DEFAULT_GB,
     poweredOffOnly: false,
@@ -6168,6 +6469,13 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     if (raw) {
       const saved = JSON.parse(raw);
       Object.keys(state).forEach(k => { if (saved[k] != null) state[k] = saved[k]; });
+      // Migrate legacy single-select `workloadFilter` → multi-pick array.
+      if (typeof saved.workloadFilter === 'string' && saved.workloadFilter && saved.workloadFilter !== 'all') {
+        if (!Array.isArray(state.workloadPick)) state.workloadPick = [];
+        if (state.workloadPick.indexOf(saved.workloadFilter) === -1) state.workloadPick.push(saved.workloadFilter);
+      }
+      if (!Array.isArray(state.workloadPick)) state.workloadPick = [];
+      state.workloadPick = state.workloadPick.filter(v => typeof v === 'string');
     }
   } catch (e) { /* ignore */ }
 
@@ -6278,15 +6586,42 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
 
   // ───────── Filtering / sorting / grouping ─────────
 
+  // Synthetic label for VMs the classifier could not categorise. Mirrors the
+  // Azure VMs picker so users see the same vocabulary across tabs.
+  const UNCLASSIFIED_LABEL = 'Unclassified';
+
+  function workloadLabelFor(row) {
+    const w = String((row && row.workloadGroup) || '').trim();
+    if (!w || w === '(unclassified)' || /^general\s*\/\s*unclassified$/i.test(w)) return UNCLASSIFIED_LABEL;
+    return w;
+  }
+
+  function workloadLabelsFromRows(rows, withCounts) {
+    const counts = new Map();
+    for (const r of (rows || [])) {
+      const label = workloadLabelFor(r);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    const labels = Array.from(counts.keys()).sort((a, b) => {
+      if (a === UNCLASSIFIED_LABEL) return 1;
+      if (b === UNCLASSIFIED_LABEL) return -1;
+      return a.localeCompare(b);
+    });
+    if (withCounts) return labels.map(l => ({ label: l, count: counts.get(l) || 0 }));
+    return labels;
+  }
+
   function applyFilters(rows, excludeVms) {
     const q = (state.filter || '').toLowerCase().trim();
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = picks.length ? new Set(picks) : null;
     return rows.filter(r => {
       if (state.poweredOnOnly  && !r.isPoweredOn) return false;
       if (state.poweredOffOnly &&  r.isPoweredOn) return false;
       if (state.multiDiskOnly && r.diskCount < 2) return false;
       if (state.userExcludedOnly && !excludeVms.has(r.vm)) return false;
       if (state.largeOnly && r.usedGB < state.largeThresholdGB) return false;
-      if (state.workloadFilter && state.workloadFilter !== 'all' && (r.workloadGroup || '(unclassified)') !== state.workloadFilter) return false;
+      if (pickSet && !pickSet.has(workloadLabelFor(r))) return false;
       if (state.selectionFilter === 'excluded' && !excludeVms.has(r.vm)) return false;
       if (state.selectionFilter === 'included' && excludeVms.has(r.vm)) return false;
       if (q && ![r.vm, r.os, r.cluster, r.folder, r.datastore, r.workloadDetail, r.matchEvidence].some(v => String(v || '').toLowerCase().includes(q))) return false;
@@ -6380,18 +6715,12 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
         ${esc(label)}
       </button>`;
 
-    // Build workload filter options dynamically from the dataset
-    const workloadCounts = new Map();
-    for (const r of rows) {
-      const w = r.workloadGroup || '(unclassified)';
-      workloadCounts.set(w, (workloadCounts.get(w) || 0) + 1);
-    }
-    const workloadOptions = Array.from(workloadCounts.entries())
-      .sort((a, b) => {
-        if (a[0] === '(unclassified)') return 1;
-        if (b[0] === '(unclassified)') return -1;
-        return a[0].localeCompare(b[0]);
-      });
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const wlPicker = workloadDropdownHtml(rows);
+    const wlChips = workloadChipsHtml();
+    const scopedSuffix = picks.length
+      ? ` <span class="rv-soft">· scoped to ${picks.length} workload${picks.length === 1 ? '' : 's'}</span>`
+      : '';
 
     return `
       <div class="rv-native-controls rv-table-toolbar" style="margin-bottom:0.65rem;">
@@ -6412,10 +6741,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
           <span class="rv-table-toolbar-sep"></span>
           <label class="text-xs rv-soft" style="display:flex;align-items:center;gap:0.35rem;">
             <strong>Workload</strong>
-            <select class="rv-ctrl-input" onchange="_rvAvsWorkloadFilter(this.value)" title="Filter rows to a single workload type. Includes (unclassified).">
-              <option value="all" ${(state.workloadFilter || 'all') === 'all' ? 'selected' : ''}>All workloads</option>
-              ${workloadOptions.map(([w, n]) => `<option value="${esc(w)}" ${state.workloadFilter === w ? 'selected' : ''}>${esc(w)} (${n})</option>`).join('')}
-            </select>
+            ${wlPicker}
           </label>
           <label class="text-xs rv-soft" style="display:flex;align-items:center;gap:0.35rem;">
             <strong>Show</strong>
@@ -6425,12 +6751,13 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
               <option value="excluded" ${state.selectionFilter === 'excluded' ? 'selected' : ''}>Excluded only</option>
             </select>
           </label>
-          <span class="text-xs rv-soft">${visible.toLocaleString()} of ${total.toLocaleString()} VMs</span>
+          <span class="text-xs rv-soft">${visible.toLocaleString()} of ${total.toLocaleString()} VMs${scopedSuffix}</span>
           ${excluded > 0
             ? `<span class="rv-badge" style="background:#fef3c7;color:#92400e;">${excluded} excluded</span>
                <button type="button" class="rv-filter-preset" onclick="_rvAvsResetExclusions()" title="Re-include every VM">↺ Reset exclusions</button>`
             : ''}
         </div>
+        ${wlChips}
         <div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
           <span class="rv-table-toolbar-label">Filter</span>
           ${chip('largeOnly', !state.largeOnly, 'Large consumers only (≥ ' + state.largeThresholdGB + ' GB)', state.largeOnly)}
@@ -6440,6 +6767,86 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
           ${chip('userExcludedOnly', !state.userExcludedOnly, 'Manually excluded only', state.userExcludedOnly)}
         </div>
       </div>`;
+  }
+
+  // ───────── Workload picker dropdown ─────────
+
+  // UI ephemera — open state + in-panel search query. Not persisted because
+  // they describe transient picker UX, not the user's intent.
+  let workloadDropdownOpen = false;
+  let workloadPickerSearch = '';
+
+  let _workloadOutsideInstalled = false;
+  function _ensureWorkloadOutsideClose() {
+    if (_workloadOutsideInstalled || typeof document === 'undefined') return;
+    _workloadOutsideInstalled = true;
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('rv-avs-workload-dropdown');
+      if (!dd || !dd.open) return;
+      if (!dd.contains(e.target)) dd.open = false;
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const dd = document.getElementById('rv-avs-workload-dropdown');
+      if (dd && dd.open) dd.open = false;
+    });
+  }
+
+  function workloadDropdownHtml(allRows) {
+    _ensureWorkloadOutsideClose();
+    const items = workloadLabelsFromRows(allRows, true);
+    if (!items.length) return '';
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = new Set(picks);
+    const onCount = items.filter(it => pickSet.has(it.label)).length;
+    const summary = onCount === 0
+      ? 'All workloads'
+      : onCount === 1
+        ? picks[0]
+        : onCount <= 2
+          ? picks.slice(0, 2).join(', ')
+          : `${picks.slice(0, 2).join(', ')} +${picks.length - 2}`;
+    const search = String(workloadPickerSearch || '').toLowerCase();
+    const rowsHtml = items.map(it => {
+      const on = pickSet.has(it.label);
+      const matches = !search || it.label.toLowerCase().includes(search);
+      const hidden = matches ? '' : ' style="display:none;"';
+      return `<label class="rv-fam-row" data-rv-wl-row="${esc(it.label.toLowerCase())}"${hidden}>
+        <input type="checkbox" ${on ? 'checked' : ''} onchange="_rvAvsWorkloadToggle(${js(it.label)}, this.checked)" />
+        <span class="rv-fam-row-label">${esc(it.label)}</span>
+        <span class="rv-fam-row-note">${it.count} VM${it.count === 1 ? '' : 's'}</span>
+      </label>`;
+    }).join('');
+    return `<details class="rv-fam-dropdown" id="rv-avs-workload-dropdown"${workloadDropdownOpen ? ' open' : ''} ontoggle="_rvAvsWorkloadOpenState(this.open)">
+      <summary class="rv-fam-summary" aria-label="Filter by workload">
+        <span class="rv-fam-summary-text">${esc(summary)}</span>
+        <span class="rv-fam-summary-caret">▾</span>
+      </summary>
+      <div class="rv-fam-menu" style="min-width:18rem;">
+        <div class="rv-fam-menu-actions" style="padding-bottom:0.4rem;">
+          <input type="text" id="rv-avs-workload-search" class="rv-ctrl-input" placeholder="Type to filter…" value="${esc(workloadPickerSearch || '')}" oninput="_rvAvsWorkloadSearch(this.value)" style="width:100%;" />
+        </div>
+        <div class="rv-fam-menu-actions">
+          <button type="button" class="rv-native-link" onclick="_rvAvsWorkloadSelectAll()">Select all</button>
+          <span class="rv-soft">·</span>
+          <button type="button" class="rv-native-link" onclick="_rvAvsWorkloadClear()">Clear</button>
+        </div>
+        <div class="rv-avs-workload-rows" style="max-height:18rem; overflow:auto;">${rowsHtml}</div>
+      </div>
+    </details>`;
+  }
+
+  function workloadChipsHtml() {
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    if (!picks.length) return '';
+    const chips = picks.map(p =>
+      `<button type="button" class="rv-filter-preset rv-filter-preset--active" onclick="_rvAvsWorkloadRemove(${js(p)})" title="Remove ${esc(p)} from filter">${esc(p)} ×</button>`
+    ).join('');
+    return `<div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
+      <span class="rv-table-toolbar-label">Workload</span>
+      ${chips}
+      ${picks.length >= 2 ? `<button type="button" class="rv-native-link" onclick="_rvAvsWorkloadClear()" title="Clear all picked workloads">Clear all</button>` : ''}
+    </div>`;
   }
 
   function sortIndicator(key) {
@@ -6777,7 +7184,62 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
 
   window._rvAvsGroup = function (val) { state.groupBy = val; saveState(); recompute(); };
   window._rvAvsSelectionFilter = function (val) { state.selectionFilter = val; saveState(); recompute(); };
-  window._rvAvsWorkloadFilter = function (val) { state.workloadFilter = val; saveState(); recompute(); };
+
+  // ───────── Workload picker handlers ─────────
+
+  function _avsWlEnsureArray() {
+    if (!Array.isArray(state.workloadPick)) state.workloadPick = [];
+    return state.workloadPick;
+  }
+  window._rvAvsWorkloadToggle = function (label, checked) {
+    if (typeof label !== 'string') return;
+    const picks = _avsWlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (checked && idx === -1) picks.push(label);
+    else if (!checked && idx !== -1) picks.splice(idx, 1);
+    saveState();
+    recompute();
+  };
+  window._rvAvsWorkloadRemove = function (label) {
+    const picks = _avsWlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (idx === -1) return;
+    picks.splice(idx, 1);
+    saveState();
+    recompute();
+  };
+  window._rvAvsWorkloadClear = function () {
+    state.workloadPick = [];
+    saveState();
+    recompute();
+  };
+  window._rvAvsWorkloadSelectAll = function () {
+    state.workloadPick = workloadLabelsFromRows(buildModels());
+    saveState();
+    recompute();
+  };
+  // Pure DOM filter inside the open dropdown — no state mutation, no recompute.
+  window._rvAvsWorkloadSearch = function (query) {
+    workloadPickerSearch = String(query || '');
+    const q = workloadPickerSearch.toLowerCase();
+    const dd = document.getElementById('rv-avs-workload-dropdown');
+    if (!dd) return;
+    dd.querySelectorAll('[data-rv-wl-row]').forEach(el => {
+      const label = el.getAttribute('data-rv-wl-row') || '';
+      el.style.display = (!q || label.includes(q)) ? '' : 'none';
+    });
+  };
+  window._rvAvsWorkloadOpenState = function (open) {
+    workloadDropdownOpen = !!open;
+  };
+  // Legacy single-select handler — kept for backward-compat with any saved
+  // bookmarklets / browser autofills. Forwards to the new multi-pick API.
+  window._rvAvsWorkloadFilter = function (val) {
+    if (!val || val === 'all') state.workloadPick = [];
+    else state.workloadPick = [val];
+    saveState();
+    recompute();
+  };
 
   window._rvAvsSort = function (key) {
     if (state.sortBy === key) state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
@@ -10019,6 +10481,10 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
       poweredOnOnly: false,
       poweredOffOnly: false,
       multiDiskOnly: false,
+      // Multi-pick workload filter (OR semantics; empty = all). Each entry is
+      // the detection label rendered by detectionMeta(), eg "File Server" or
+      // "File Server (inferred)".
+      workloadPick: [],
       lastCalculated: '',
       // UI toggle on Card 4 — 'tier' = tier-mix donut; 'lift' = Modernize vs Lift.
       uiCostView: 'tier',
@@ -10027,6 +10493,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') || {};
       const merged = Object.assign({}, defaults, saved);
       merged.settings = Object.assign({}, defaults.settings, saved.settings || {});
+      merged.workloadPick = Array.isArray(saved.workloadPick) ? saved.workloadPick.filter(v => typeof v === 'string') : [];
       return merged;
     } catch (_) { return defaults; }
   }
@@ -10037,6 +10504,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
 
   const state = loadState();
   let lastResult = null;
+  let _lastScopedTotals = null;
   let _donut = null;
   let _donutLift = null;
 
@@ -11442,6 +11910,16 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     const detectedCount = result.totals.detectedCount + result.totals.manualCount;
     const chip = (key, val, label, on) =>
       `<button type="button" class="rv-filter-preset ${on ? 'rv-filter-preset--active' : ''}" onclick="_rvFsToggleFilter('${key}', ${typeof val === 'string' ? "'" + val + "'" : val})">${esc(label)}</button>`;
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    // Picker source = rows that are file-server candidates (detected or
+    // manually selected). Skipping non-candidates keeps the "Unclassified"
+    // bucket from swallowing every unrelated VM in the workbook.
+    const candidateRows = (result.rows || []).filter(r => r.fsDetected || state.selected[r.key] != null);
+    const wlPicker = fsWorkloadDropdownHtml(candidateRows);
+    const wlChips = fsWorkloadChipsHtml();
+    const scopedSuffix = picks.length
+      ? ` <span class="rv-soft">· scoped to ${picks.length} workload${picks.length === 1 ? '' : 's'}</span>`
+      : '';
     return `
       <div class="rv-native-controls rv-table-toolbar" style="margin-bottom:0.65rem;">
         <div class="rv-table-toolbar-row">
@@ -11460,6 +11938,10 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
           <button type="button" class="rv-filter-preset" onclick="_rvFsAllGroups(true)" title="Collapse every group">⤒ Collapse all</button>
           <span class="rv-table-toolbar-sep"></span>
           <label class="text-xs rv-soft" style="display:flex;align-items:center;gap:0.35rem;">
+            <strong>Workload</strong>
+            ${wlPicker}
+          </label>
+          <label class="text-xs rv-soft" style="display:flex;align-items:center;gap:0.35rem;">
             <strong>Show</strong>
             <select class="rv-ctrl-input" onchange="_rvFsVisibility(this.value)" title="Filter rows by detection / scope state.">
               ${[
@@ -11475,9 +11957,10 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
               ].map(([v, l]) => `<option value="${v}" ${(state.visibility || 'fsOnly') === v ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
           </label>
-          <span class="text-xs rv-soft">${visibleCount.toLocaleString()} of ${total.toLocaleString()} VMs</span>
+          <span class="text-xs rv-soft">${visibleCount.toLocaleString()} of ${total.toLocaleString()} VMs${scopedSuffix}</span>
           ${detectedCount > 0 ? `<span class="rv-badge" style="background:#dbeafe;color:#1e40af;">${detectedCount} detected</span>` : ''}
         </div>
+        ${wlChips}
         <div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
           <span class="rv-table-toolbar-label">Filter</span>
           ${chip('largeOnly',         !state.largeOnly,         'Large consumers only (≥ ' + state.largeThresholdGB + ' GB)', state.largeOnly)}
@@ -11486,6 +11969,88 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
           ${chip('multiDiskOnly',     !state.multiDiskOnly,     'Multi-disk only',          state.multiDiskOnly)}
         </div>
       </div>`;
+  }
+
+  // ───────── Workload picker dropdown ─────────
+
+  // UI ephemera — open state + in-panel search query. Not persisted because
+  // they describe transient picker UX, not the user's intent.
+  let fsWorkloadDropdownOpen = false;
+  let fsWorkloadPickerSearch = '';
+
+  let _fsWorkloadOutsideInstalled = false;
+  function _ensureFsWorkloadOutsideClose() {
+    if (_fsWorkloadOutsideInstalled || typeof document === 'undefined') return;
+    _fsWorkloadOutsideInstalled = true;
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('rv-fs-workload-dropdown');
+      if (!dd || !dd.open) return;
+      if (!dd.contains(e.target)) dd.open = false;
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const dd = document.getElementById('rv-fs-workload-dropdown');
+      if (dd && dd.open) dd.open = false;
+    });
+  }
+
+  function fsWorkloadDropdownHtml(allRows) {
+    _ensureFsWorkloadOutsideClose();
+    const items = workloadLabelsFromRows(allRows, true);
+    if (!items.length) return '';
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = new Set(picks);
+    const onCount = items.filter(it => pickSet.has(it.label)).length;
+    const summary = onCount === 0
+      ? 'All workloads'
+      : onCount === 1
+        ? picks[0]
+        : onCount <= 2
+          ? picks.slice(0, 2).join(', ')
+          : `${picks.slice(0, 2).join(', ')} +${picks.length - 2}`;
+    const search = String(fsWorkloadPickerSearch || '').toLowerCase();
+    const rowsHtml = items.map(it => {
+      const on = pickSet.has(it.label);
+      const matches = !search || it.label.toLowerCase().includes(search);
+      const hidden = matches ? '' : ' style="display:none;"';
+      const safeLabel = String(it.label).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `<label class="rv-fam-row" data-rv-wl-row="${esc(it.label.toLowerCase())}"${hidden}>
+        <input type="checkbox" ${on ? 'checked' : ''} onchange="_rvFsWorkloadToggle('${safeLabel}', this.checked)" />
+        <span class="rv-fam-row-label">${esc(it.label)}</span>
+        <span class="rv-fam-row-note">${it.count} VM${it.count === 1 ? '' : 's'}</span>
+      </label>`;
+    }).join('');
+    return `<details class="rv-fam-dropdown" id="rv-fs-workload-dropdown"${fsWorkloadDropdownOpen ? ' open' : ''} ontoggle="_rvFsWorkloadOpenState(this.open)">
+      <summary class="rv-fam-summary" aria-label="Filter by workload">
+        <span class="rv-fam-summary-text">${esc(summary)}</span>
+        <span class="rv-fam-summary-caret">▾</span>
+      </summary>
+      <div class="rv-fam-menu" style="min-width:18rem;">
+        <div class="rv-fam-menu-actions" style="padding-bottom:0.4rem;">
+          <input type="text" id="rv-fs-workload-search" class="rv-ctrl-input" placeholder="Type to filter…" value="${esc(fsWorkloadPickerSearch || '')}" oninput="_rvFsWorkloadSearch(this.value)" style="width:100%;" />
+        </div>
+        <div class="rv-fam-menu-actions">
+          <button type="button" class="rv-native-link" onclick="_rvFsWorkloadSelectAll()">Select all</button>
+          <span class="rv-soft">·</span>
+          <button type="button" class="rv-native-link" onclick="_rvFsWorkloadClear()">Clear</button>
+        </div>
+        <div class="rv-fs-workload-rows" style="max-height:18rem; overflow:auto;">${rowsHtml}</div>
+      </div>
+    </details>`;
+  }
+
+  function fsWorkloadChipsHtml() {
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    if (!picks.length) return '';
+    const chips = picks.map(p => {
+      const safe = String(p).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `<button type="button" class="rv-filter-preset rv-filter-preset--active" onclick="_rvFsWorkloadRemove('${safe}')" title="Remove ${esc(p)} from filter">${esc(p)} ×</button>`;
+    }).join('');
+    return `<div class="rv-table-toolbar-row rv-table-toolbar-row--filters">
+      <span class="rv-table-toolbar-label">Workload</span>
+      ${chips}
+      ${picks.length >= 2 ? `<button type="button" class="rv-native-link" onclick="_rvFsWorkloadClear()" title="Clear all picked workloads">Clear all</button>` : ''}
+    </div>`;
   }
 
   // Detection / confidence helpers for the polished rows.
@@ -11523,6 +12088,90 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     }
   }
 
+  // ───────── Workload picker helpers ─────────
+  //
+  // The picker uses the detection label (eg "File Server" / "File Server
+  // (inferred)" / "SureSync · DFS-R") as the workload key — this matches the
+  // user mental model of "show me the named file servers and the inferred
+  // ones" on this tab, mirroring the Azure VMs tab's workload picker UX.
+
+  const UNCLASSIFIED_LABEL = 'Unclassified';
+
+  function workloadLabelFor(row) {
+    if (!row) return UNCLASSIFIED_LABEL;
+    const meta = detectionMeta(row);
+    const lbl = (meta && meta.label) || '';
+    if (!lbl || lbl === '—') return UNCLASSIFIED_LABEL;
+    return lbl;
+  }
+
+  function workloadLabelsFromRows(rows, withCounts) {
+    const counts = new Map();
+    for (const r of (rows || [])) {
+      const label = workloadLabelFor(r);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    const labels = Array.from(counts.keys()).sort((a, b) => {
+      if (a === UNCLASSIFIED_LABEL) return 1;
+      if (b === UNCLASSIFIED_LABEL) return -1;
+      return a.localeCompare(b);
+    });
+    if (withCounts) return labels.map(l => ({ label: l, count: counts.get(l) || 0 }));
+    return labels;
+  }
+
+  // Build a `totals` object identical in shape to compute()'s output but
+  // restricted to the picked-workload subset. Sums per-row standalone costs
+  // (rows[].monthly is the "if separate" tier cost) for the rescoped panels;
+  // we don't re-run the bin-packing consolidator on a subset because that
+  // would invent fake account counts.
+  function scopedTotalsFromRows(filteredRows, baseTotals) {
+    const byTarget = {
+      standard:    { count: 0, shareGB: 0, monthly: 0 },
+      'v2-hdd':    { count: 0, shareGB: 0, monthly: 0 },
+      'v2-ssd':    { count: 0, shareGB: 0, monthly: 0 },
+      premium:     { count: 0, shareGB: 0, monthly: 0 },
+      'anf-std':   { count: 0, shareGB: 0, monthly: 0 },
+      'anf-prem':  { count: 0, shareGB: 0, monthly: 0 },
+      'anf-ultra': { count: 0, shareGB: 0, monthly: 0 },
+    };
+    let included = 0, shareGB = 0, monthly = 0;
+    for (const r of filteredRows) {
+      if (!r.include) continue;
+      included++;
+      shareGB += r.shareGB || 0;
+      monthly += r.monthly || 0;
+      const bt = byTarget[r.target];
+      if (bt) {
+        bt.count++;
+        bt.shareGB += r.shareGB || 0;
+        bt.monthly += r.monthly || 0;
+      }
+    }
+    const onPremPerGB = +(state.settings && state.settings.onPremPerGBMo) || ONPREM_PER_GB_MONTH_DEFAULT;
+    const fx = fxFor(state.settings && state.settings.currency);
+    return {
+      included,
+      excluded:      (baseTotals && baseTotals.excluded) || 0,
+      pending:       (baseTotals && baseTotals.pending) || 0,
+      detectedCount: (baseTotals && baseTotals.detectedCount) || 0,
+      manualCount:   (baseTotals && baseTotals.manualCount) || 0,
+      demotedCount:  (baseTotals && baseTotals.demotedCount) || 0,
+      totalVms:      (baseTotals && baseTotals.totalVms) || 0,
+      shareGB,
+      monthly,
+      ribbonOnPrem: shareGB * onPremPerGB * fx,
+      byTarget,
+      // Carry through estate-wide consolidation + recommendation context so
+      // the UI doesn't crash on missing fields; consolidation account counts
+      // are estate-wide, not scoped (re-running bin-packing per pick would
+      // mislead).
+      consolidation:   (baseTotals && baseTotals.consolidation) || { accounts: { gpv2: [], fileStorage: [], fileStorageV2: [], anfPool: [] } },
+      recommendations: (baseTotals && baseTotals.recommendations) || [],
+      scoped: true,
+    };
+  }
+
   // Apply filter chips + search + show-state filter. Returns the visible rows
   // post-filter but pre-sort/group; rows that aren't fsDetected and weren't
   // user-toggled are excluded so we don't dump every VM into this table.
@@ -11530,6 +12179,8 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     const f = (state.filter || '').toLowerCase();
     const thr = +state.largeThresholdGB || 500;
     const vis = state.visibility || 'fsOnly';
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    const pickSet = picks.length ? new Set(picks) : null;
     return rows.filter(r => {
       // Candidate gate — mirrors the SQL tab's "don't dump every VM". Only
       // bypassed when the user explicitly picks "All VMs".
@@ -11546,6 +12197,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
         case 'excluded': if (r.include) return false; break;
         // 'all' — no gating
       }
+      if (pickSet && !pickSet.has(workloadLabelFor(r))) return false;
       if (f && !((r.name || '') + ' ' + (r.cluster || '') + ' ' + (r.folder || '') + ' ' + (r.os || '')).toLowerCase().includes(f)) return false;
       if (state.largeOnly && (r.shareGB || 0) < thr) return false;
       if (state.poweredOnOnly  && !/on/i.test(r.powerState || '')) return false;
@@ -11843,10 +12495,28 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
       return;
     }
     lastResult = result;
+
+    // If the workload picker has active picks, rescope the cost panel + donut
+    // + footer to just those rows. Table view continues to use the un-scoped
+    // result so the user can still see / toggle excluded rows.
+    const picks = Array.isArray(state.workloadPick) ? state.workloadPick : [];
+    let scopedResult = result;
+    let footerTotals = result.totals;
+    let scopedSuffix = '';
+    if (picks.length > 0) {
+      const pickSet = new Set(picks);
+      const scopedRows = (result.rows || []).filter(r => pickSet.has(workloadLabelFor(r)));
+      const scopedTotals = scopedTotalsFromRows(scopedRows, result.totals);
+      scopedResult = Object.assign({}, result, { totals: scopedTotals });
+      footerTotals = scopedTotals;
+      scopedSuffix = ` · <span class="rv-soft">scoped to ${picks.length} workload${picks.length === 1 ? '' : 's'}</span>`;
+    }
+    _lastScopedTotals = footerTotals;
+
     el.innerHTML = `
       ${controlsHtml(result)}
-      ${demandHtml(result)}
-      ${costHtml(result)}
+      ${demandHtml(scopedResult)}
+      ${costHtml(scopedResult)}
       <div class="rv-step-card mb-3">
         <div class="rv-step-label">5 · File-server VMs &amp; per-row sizing</div>
         <div class="rv-soft" style="margin:0.25rem 0 0.75rem; font-size: var(--rv-fs-sm); line-height:1.5;">
@@ -11856,9 +12526,9 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
         ${tableHtml(result)}
       </div>
       ${pricingModelHtml(result)}
-      <div class="rv-native-footer">Last calculated ${esc(state.lastCalculated || '—')} · ${result.totals.included.toLocaleString()} included file-server VMs</div>
+      <div class="rv-native-footer">Last calculated ${esc(state.lastCalculated || '—')} · ${footerTotals.included.toLocaleString()} included file-server VMs${scopedSuffix}</div>
     `;
-    drawDonut(result);
+    drawDonut(scopedResult);
     restoreFsScrollAnchor();
   }
 
@@ -12071,6 +12741,55 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     saveState();
     scheduleRecompute();
   };
+
+  // ───────── Workload picker handlers ─────────
+
+  function _fsWlEnsureArray() {
+    if (!Array.isArray(state.workloadPick)) state.workloadPick = [];
+    return state.workloadPick;
+  }
+  window._rvFsWorkloadToggle = function (label, checked) {
+    if (typeof label !== 'string') return;
+    const picks = _fsWlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (checked && idx === -1) picks.push(label);
+    else if (!checked && idx !== -1) picks.splice(idx, 1);
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvFsWorkloadRemove = function (label) {
+    const picks = _fsWlEnsureArray();
+    const idx = picks.indexOf(label);
+    if (idx === -1) return;
+    picks.splice(idx, 1);
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvFsWorkloadClear = function () {
+    state.workloadPick = [];
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvFsWorkloadSelectAll = function () {
+    if (!lastResult) return;
+    state.workloadPick = workloadLabelsFromRows(lastResult.rows);
+    saveState();
+    scheduleRecompute();
+  };
+  window._rvFsWorkloadSearch = function (query) {
+    fsWorkloadPickerSearch = String(query || '');
+    const q = fsWorkloadPickerSearch.toLowerCase();
+    const dd = document.getElementById('rv-fs-workload-dropdown');
+    if (!dd) return;
+    dd.querySelectorAll('[data-rv-wl-row]').forEach(el => {
+      const label = el.getAttribute('data-rv-wl-row') || '';
+      el.style.display = (!q || label.includes(q)) ? '' : 'none';
+    });
+  };
+  window._rvFsWorkloadOpenState = function (open) {
+    fsWorkloadDropdownOpen = !!open;
+  };
+
   // Bulk include/exclude every currently visible (post-filter) row.
   window._rvFsBulkVisible = function (checked) {
     if (!lastResult) return;
@@ -12123,6 +12842,8 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
   // current rollup without re-running compute.
   window.rvFileServers = {
     get lastResult() { return lastResult; },
+    getScopedTotals() { return _lastScopedTotals || (lastResult && lastResult.totals) || null; },
+    getWorkloadPick() { return Array.isArray(state.workloadPick) ? state.workloadPick.slice() : []; },
     recompute,
   };
 })();
@@ -12137,6 +12858,28 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
   const AVS_COLOR_SOFT = '#ede9fe';
   const AZ_COLOR = '#0078D4';       // Azure blue
   const AZ_COLOR_SOFT = '#dbeafe';
+
+  // Persisted preference: should the Azure VMs column on this page be scoped
+  // to the workloads picked on the Azure VMs tab? Off by default so existing
+  // visitors see the full-estate comparison they're used to.
+  const SCOPE_KEY = 'rv-cc-scope-workload';
+  function getScopeWorkload() {
+    try { return localStorage.getItem(SCOPE_KEY) === '1'; } catch (_) { return false; }
+  }
+  function setScopeWorkload(on) {
+    try { localStorage.setItem(SCOPE_KEY, on ? '1' : '0'); } catch (_) { /* non-critical */ }
+  }
+  // Read picks + scoped totals from the Azure VMs module (set by its render()).
+  function getNativeWorkloadPicks() {
+    const api = window.rvAzureNative;
+    if (!api || typeof api.getWorkloadPick !== 'function') return [];
+    try { return api.getWorkloadPick() || []; } catch (_) { return []; }
+  }
+  function getNativeScopedTotals() {
+    const api = window.rvAzureNative;
+    if (!api || typeof api.getScopedTotals !== 'function') return null;
+    try { return api.getScopedTotals(); } catch (_) { return null; }
+  }
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   function symbolFor(curr) { return ({ USD: '$', AUD: 'A$', EUR: '€', GBP: '£', JPY: '¥', INR: '₹', BRL: 'R$', CAD: 'CA$' })[curr] || (curr ? curr + ' ' : '$'); }
@@ -12163,7 +12906,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     let implicitVcfCost = 0;
     if (!vcfEnabled) {
       const skuCores = (p.skuKey === 'AV48') ? 48 : 64;
-      const vcfPerNodeMonth = (350 * skuCores) / 12; // USD per node per month
+      const vcfPerNodeMonth = (450 * skuCores) / 12; // USD per node per month
       implicitVcfCost = p.nodes * vcfPerNodeMonth * (p.curr || 1);
     }
     const vcfCost = p.totalVcfCost + implicitVcfCost;
@@ -12192,11 +12935,29 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
   function getNativeSnap() {
     const r = window._rvAzureNativeLast;
     if (!r || !r.totals || !r.settings) return null;
-    const t = r.totals;
+    // Optionally swap in scoped totals (workload picker on the Azure VMs tab).
+    // Picks live on the Azure VMs tab; we just consume the pre-computed totals.
+    const picks = getNativeWorkloadPicks();
+    const scopeOn = getScopeWorkload() && picks.length > 0;
+    const scoped = scopeOn ? getNativeScopedTotals() : null;
+    const t = scoped || r.totals;
     const s = r.settings;
     const sym = symbolFor(s.currency);
     const TERM_LABEL = { payg: 'PAYG', ri1y: '1yr RI', ri3y: '3yr RI', sp1y: '1yr Savings Plan', sp3y: '3yr Savings Plan' };
-    const includedRows = (r.rows || []).filter(x => x.include);
+    // When scoped, count vCPU/RAM/storage from rows that pass the workload filter.
+    // Keep this lightweight — same row shape, just a different subset.
+    const allRows = r.rows || [];
+    let scopedRows = allRows;
+    if (scopeOn) {
+      const pickSet = new Set(picks);
+      const labelOf = (row) => {
+        const w = String((row && row.workload) || '').trim();
+        if (!w || /^general\s*\/\s*unclassified$/i.test(w)) return 'Unclassified';
+        return w;
+      };
+      scopedRows = allRows.filter(x => pickSet.has(labelOf(x)));
+    }
+    const includedRows = scopedRows.filter(x => x.include);
     const sumVcpu = includedRows.reduce((a, x) => a + (x.cpus || 0), 0);
     const sumRam = includedRows.reduce((a, x) => a + (x.ramGB || 0), 0);
     const sumStorageGB = t.billedGB || 0;
@@ -12219,6 +12980,8 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
         defender: t.defenderCost,
       },
       demand: { vcpu: sumVcpu, ramGB: sumRam, storageTB: sumStorageGB / 1024 },
+      scoped: scopeOn,
+      scopedPicks: scopeOn ? picks.slice() : [],
     };
   }
 
@@ -12260,7 +13023,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
   function costCard(side, snap, accent, accentSoft) {
     const isAvs = side === 'avs';
     const title = isAvs ? 'Azure VMware Solution' : 'Azure Native VMs';
-    const sub = isAvs ? `${snap.nodes} × ${esc(snap.sku)} · ${esc(snap.term)}` : `${snap.vmCount} VMs · ${esc(snap.term)}${snap.ahub ? ' · AHUB' : ''}`;
+    const sub = isAvs ? `${snap.nodes} × ${esc(snap.sku)} · ${esc(snap.term)}` : `${snap.vmCount} VMs · ${esc(snap.term)}${snap.ahub ? ' · AHUB' : ''}${snap.scoped ? ` · scoped (${snap.scopedPicks.length})` : ''}`;
     const breakdownRows = isAvs ? [
       { label: 'AVS nodes', value: snap.breakdown.nodes, color: accent },
       ...(snap.breakdown.vcf > 0 ? [{ label: 'VCF licensing', value: snap.breakdown.vcf, color: '#78BE20' }] : []),
@@ -12439,6 +13202,29 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     </div>`;
   }
 
+  // Small toggle bar — only meaningful when the user has picked workloads on
+  // the Azure VMs tab. Disabled with explanatory tooltip otherwise so it's
+  // discoverable without being a footgun.
+  function scopeToggleBar() {
+    const picks = getNativeWorkloadPicks();
+    const on = getScopeWorkload() && picks.length > 0;
+    const hasPicks = picks.length > 0;
+    const summary = hasPicks
+      ? (picks.length === 1 ? picks[0] : `${picks.length} workloads`)
+      : 'No workloads picked';
+    const tip = hasPicks
+      ? 'When on, the Azure VMs column below reflects only the workloads picked on the Azure VMs tab.'
+      : 'Pick one or more workloads on the Azure VMs tab to enable scoped comparison.';
+    return `<div class="rv-step-card mb-3" style="padding:0.55rem 0.85rem; display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;${hasPicks ? '' : ' opacity:0.7;'}">
+      <span class="rv-step-label" style="margin:0;">Azure VMs scope</span>
+      <label style="display:inline-flex; align-items:center; gap:0.4rem; font-size: var(--rv-fs-sm); ${hasPicks ? '' : 'cursor:not-allowed;'}" title="${esc(tip)}">
+        <input type="checkbox" ${on ? 'checked' : ''} ${hasPicks ? '' : 'disabled'} onchange="_rvCcSetScopeWorkload(this.checked)" />
+        <span>Scope to picked workloads</span>
+      </label>
+      <span class="rv-soft" style="font-size: var(--rv-fs-xs);">${esc(summary)}</span>
+    </div>`;
+  }
+
   function assumptionsStrip(avs, az) {
     const regionWarn = avs.region !== az.region;
     const currencyWarn = avs.currency !== az.currency;
@@ -12453,7 +13239,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
         ${chip('Currency', `${esc(avs.currency)} / ${esc(az.currency)}`, currencyWarn, currencyWarn ? 'Currencies differ; switch one tab to match for accurate deltas.' : '')}
         ${chip('Pricing term', `${esc(avs.term)} / ${esc(az.term)}`, false)}
         ${chip('AHUB', az.ahub ? ((az.ahubSavings || 0) > 0 ? `On · saves ${fmtMoneyShort(az.ahubSavings, az.sym)}/mo` : 'On for Azure VMs') : 'Off for Azure VMs', false)}
-        ${chip('VCF', avs.vcfImplicit ? `Auto-included ${fmtMoneyShort(avs.breakdown.vcf, avs.sym)}/mo` : 'Enabled in AVS', !!avs.vcfImplicit, avs.vcfImplicit ? 'Production AVS requires VCF. This page adds an estimate at $350/core/year when the AVS slider is off.' : '')}
+        ${chip('VCF', avs.vcfImplicit ? `Auto-included ${fmtMoneyShort(avs.breakdown.vcf, avs.sym)}/mo` : 'Enabled in AVS', !!avs.vcfImplicit, avs.vcfImplicit ? 'Production AVS requires VCF. This page adds an estimate at $450/core/year when the AVS slider is off.' : '')}
       </div>
     </div>`;
   }
@@ -12515,6 +13301,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     if (!az) { el.innerHTML = emptyState('Visit the Azure VMs tab once so we have a sizing snapshot.'); return; }
 
     el.innerHTML = `
+      ${scopeToggleBar()}
       ${assumptionsStrip(avs, az)}
       ${verdictBanner(avs, az)}
       <div class="rv-cc-cards mb-3">
@@ -12528,6 +13315,11 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     `;
     // Trade-off matrix hidden for now (kept in source for easy revival): tradeoffMatrix()
     // Capacity utilisation panel removed.
+  };
+
+  window._rvCcSetScopeWorkload = function (on) {
+    setScopeWorkload(!!on);
+    if (typeof window.renderCostComparison === 'function') window.renderCostComparison();
   };
 })();
 
@@ -18550,10 +19342,10 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     const avsDiscountPct = Math.max(0, Math.min(100, state.avsDiscount || 0)) / 100;
     const totalNodeCost = nodes * monthlyPerNode * (1 - avsDiscountPct) * curr;
 
-    // VCF cost ($350/core/yr is published in USD; apply same FX as compute).
+    // VCF cost ($450/core/yr is published in USD; apply same FX as compute).
     let totalVcfCost = 0;
     if (state.vcfEnabled) {
-      const vcfPerCoreYear = 350; // USD
+      const vcfPerCoreYear = 450; // USD
       const vcfPerNodeMonth = (vcfPerCoreYear * skuSpec.cores) / 12;
       const discount = Math.max(0, Math.min(100, state.vcfDiscount || 0)) / 100;
       // For fx-fallback we already have curr=FX rate. For per-currency snapshots
