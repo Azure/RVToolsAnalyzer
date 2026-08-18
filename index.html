@@ -1,4 +1,4 @@
-<!-- RVTools Analyzer v5.4 · Built 2026-08-18 07:03 · © Shaun Jacob -->
+<!-- RVTools Analyzer v5.4 · Built 2026-08-18 07:09 · © Shaun Jacob -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22472,6 +22472,7 @@ code, pre {
   border-radius: 14px;
   background: rgba(0, 120, 212, 0.028);
   text-align: center;
+  cursor: pointer;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02), inset 0 0 0 1px rgba(255, 255, 255, 0.6);
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease;
 }
@@ -25827,10 +25828,16 @@ pre.rv-raw {
     <!-- Upload Area / Drop Zone (Full Width Card) -->
     <div class="rv-upload-wrap">
       <div
+        @click="$refs.rvFileInput.click()"
+        @keydown.enter.prevent="$refs.rvFileInput.click()"
+        @keydown.space.prevent="$refs.rvFileInput.click()"
         @dragover.prevent="dragOver = true"
         @dragleave.prevent="dragOver = false"
         @drop.prevent="onDrop($event)"
         :class="{ 'is-active': dragOver }"
+        role="button"
+        tabindex="0"
+        aria-label="Choose RVTools Excel files"
         class="rv-dropzone-card">
         <div class="rv-dropzone-icon-wrap" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
@@ -25847,9 +25854,9 @@ pre.rv-raw {
           </span>
         </p>
         <p class="rv-dropzone-sub">or select from your computer</p>
-        <label class="rv-dropzone-btn">
+        <label class="rv-dropzone-btn" @click.stop>
           <span>Browse files</span>
-          <input type="file" multiple accept=".xlsx" class="hidden" @change="onPick($event)" />
+          <input x-ref="rvFileInput" type="file" multiple accept=".xlsx" class="hidden" @change="onPick($event)" />
         </label>
       </div>
 
