@@ -1,4 +1,4 @@
-<!-- RVTools Analyzer v5.8 · Built 2026-08-29 10:37 · © Shaun Jacob -->
+<!-- RVTools Analyzer v5.9 · Built 2026-08-29 11:09 · © Shaun Jacob -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7,7 +7,7 @@
   <title>RVTools Analyzer — AVS Migration Snapshot</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MiA1MiIgZmlsbD0ibm9uZSI+CiAgPHBhdGggZD0iTTcgMzVWMTdoMTJ2MThIN1oiIGZpbGw9IiMwMDc4RDQiIG9wYWNpdHk9Ii4yNSIvPgogIDxwYXRoIGQ9Ik0yMCAyOVYxMWgxMnYxOEgyMFoiIGZpbGw9IiMwMDc4RDQiIG9wYWNpdHk9Ii41NSIvPgogIDxwYXRoIGQ9Ik0zMyAyM1Y1aDEydjE4SDMzWiIgZmlsbD0iIzAwNzhENCIvPgogIDxwYXRoIGQ9Ik0xMyA0M2gyN00zNCAzN2w2IDYtNiA2IiBzdHJva2U9IiMwMDc4RDQiIHN0cm9rZS13aWR0aD0iMy41IiBzdHJva2UtbGluZWNhcD0ic3F1YXJlIiBzdHJva2UtbGluZWpvaW49Im1pdGVyIi8+Cjwvc3ZnPg==" />
   <meta name="description" content="Analyze RVTools exports for Azure VMware Solution migration — 100% client-side, no upload" />
-  <meta name="app-version" content="v5.8" />
+  <meta name="app-version" content="v5.9" />
 
   <!-- Theme toggle (light/dark) — load early to avoid FOUC -->
   <script>/* assets/theme.js */
@@ -4832,6 +4832,53 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
 })();
 
 </script>
+  <script>/* assets/avs-settings-state.js */
+// Serializable project-state adapter for AVS commercial and sizing controls.
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.rvAvsSettingsState = api;
+})(typeof window !== 'undefined' ? window : globalThis, function () {
+  'use strict';
+
+  const DEFAULTS = Object.freeze({
+    sku: 'AV64', targetUtil: 0.95, nPlusOne: false,
+    region: 'eastus', storageOption: 'esan-lrs', currency: 'USD', pricingTerm: 'ri3y',
+    vcfEnabled: false, vcfPricePerCoreUsd: 400, avsDiscount: 0, storageDiscount: 0,
+    cpuOvercommit: 4.0, memOvercommit: 1.0, storagePolicy: 'auto', vsanCompression: 1.5,
+    excludePoweredOffCpuRam: true, excludePoweredOffStorage: true,
+    nodeOverride: null,
+  });
+
+  function snapshot(state) {
+    const value = {};
+    for (const key of Object.keys(DEFAULTS)) value[key] = state[key];
+    value.overrides = Object.assign({ vcpu: null, ramGB: null, storageTB: null }, state.overrides || {});
+    value.excludeVms = Array.from(state.excludeVms instanceof Set ? state.excludeVms : []);
+    return value;
+  }
+
+  function restore(state, value) {
+    const saved = value && typeof value === 'object' ? value : {};
+    for (const [key, fallback] of Object.entries(DEFAULTS)) {
+      state[key] = Object.prototype.hasOwnProperty.call(saved, key) ? saved[key] : fallback;
+    }
+    state.overrides = Object.assign({ vcpu: null, ramGB: null, storageTB: null }, saved.overrides || {});
+    if (!(state.excludeVms instanceof Set)) state.excludeVms = new Set();
+    state.excludeVms.clear();
+    if (Array.isArray(saved.excludeVms)) {
+      for (const vmName of saved.excludeVms) if (typeof vmName === 'string') state.excludeVms.add(vmName);
+    }
+    return state;
+  }
+
+  function reset(state) {
+    return restore(state, {});
+  }
+
+  return { DEFAULTS, snapshot, restore, reset };
+});
+</script>
   <script>/* assets/azure-native.js */
 // assets/azure-native.js
 // Azure native IaaS sizing and pricing estimator. Runs entirely in-browser.
@@ -7841,6 +7888,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
     if (!_cachedExcludeVms) return;
     if (exclude) _cachedExcludeVms.add(vmName);
     else         _cachedExcludeVms.delete(vmName);
+    if (window.rvProjectState) window.rvProjectState.notifyChanged('avsSettings');
     recompute(vmName);
   };
 
@@ -7851,6 +7899,7 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       if (exclude) _cachedExcludeVms.add(r.vm);
       else         _cachedExcludeVms.delete(r.vm);
     }
+    if (window.rvProjectState) window.rvProjectState.notifyChanged('avsSettings');
     recompute();
   };
 
@@ -7861,12 +7910,14 @@ window.__AVS_PRICES_BUNDLED_ALL={"AUD":{"v":1,"currency":"AUD","fetchedAt":"2026
       if (include) _cachedExcludeVms.delete(r.vm);
       else         _cachedExcludeVms.add(r.vm);
     }
+    if (window.rvProjectState) window.rvProjectState.notifyChanged('avsSettings');
     recompute();
   };
 
   window._rvAvsResetExclusions = function () {
     if (!_cachedExcludeVms) return;
     _cachedExcludeVms.clear();
+    if (window.rvProjectState) window.rvProjectState.notifyChanged('avsSettings');
     recompute();
   };
 
@@ -19110,6 +19161,18 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
   // Expose to other modules (avs-sizing.js reads excludePoweredOff* toggles).
   window.sizingState = sizingState;
 
+  function notifyAvsSettingsChanged() {
+    if (window.rvProjectState) window.rvProjectState.notifyChanged('avsSettings');
+  }
+
+  if (window.rvProjectState && window.rvAvsSettingsState) {
+    window.rvProjectState.registerAdapter('avsSettings', {
+      snapshot: () => window.rvAvsSettingsState.snapshot(sizingState),
+      restore: value => window.rvAvsSettingsState.restore(sizingState, value),
+      resetAssessment: () => window.rvAvsSettingsState.reset(sizingState),
+    });
+  }
+
   function normalizeVcfUsdPrice(value) {
     const price = Number(value);
     return Number.isFinite(price) ? Math.max(0, price) : 400;
@@ -20774,6 +20837,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
       const val = parseFloat(input.value);
       if (!isNaN(val) && val >= 0) {
         sizingState.overrides[key] = val;
+        notifyAvsSettingsChanged();
       }
       _rvRecomputeSizing();
     };
@@ -20786,6 +20850,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
 
   window._rvSizingOverrideReset = function (key) {
     sizingState.overrides[key] = null;
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
@@ -20894,6 +20959,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     if ((key === 'region' || key === 'currency') && window.rvGlobalSettings) {
       window.rvGlobalSettings.set({ [key]: value });
     }
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
@@ -20901,6 +20967,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     const displayPrice = Number(value);
     const normalizedPrice = Number.isFinite(displayPrice) ? Math.ceil(Math.max(0, displayPrice) - 1e-9) : 0;
     sizingState.vcfPricePerCoreUsd = normalizedPrice / vcfFxForCurrency(sizingState.currency || 'USD');
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
@@ -20917,11 +20984,13 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     const next = current + delta;
     if (next < 3) return;
     sizingState.nodeOverride = next;
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
   window._rvNodeReset = function () {
     sizingState.nodeOverride = null;
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
@@ -20931,6 +21000,7 @@ window.__FILES_PRICES_BUNDLED={"v":1,"currency":"USD","fetchedAt":"2026-05-18T12
     } else {
       sizingState.excludeVms.delete(vmName);
     }
+    notifyAvsSettingsChanged();
     _rvRecomputeSizing();
   };
 
@@ -27409,14 +27479,14 @@ pre.rv-raw {
               </div>
               <div class="rv-privacy-card-body">
                 <label class="rv-privacy-opt">
-                  <input type="checkbox" x-model="exportPrivacy.stripFqdn" />
+                  <input type="checkbox" x-model="exportPrivacy.stripFqdn" @change="if (hasResults) { projectDirty = true; projectNotice = ''; }" />
                   <span class="rv-privacy-opt-text">
                     <strong>Shorten hostnames</strong>
                     <span class="rv-privacy-opt-detail"><code>esxi01.corp.example.com</code> → <code>esxi01</code></span>
                   </span>
                 </label>
                 <label class="rv-privacy-opt">
-                  <input type="checkbox" x-model="exportPrivacy.anonymise" />
+                  <input type="checkbox" x-model="exportPrivacy.anonymise" @change="if (hasResults) { projectDirty = true; projectNotice = ''; }" />
                   <span class="rv-privacy-opt-text">
                     <strong>Anonymise identifiers</strong>
                     <span class="rv-privacy-opt-detail">Replaces VM, host, cluster, datastore, folder and source-file names with stable placeholders (<code>vm-0142</code>, <code>host-001</code>, <code>cluster-A</code>).</span>
@@ -27459,7 +27529,7 @@ pre.rv-raw {
     </div>
 
     <footer class="rv-app-footer mt-8 text-center text-xs">
-      v5.8
+      v5.9
       <p class="mt-1" style="color: var(--rv-primary); font-weight: 600;">Created by Shaun Jacob</p>
     </footer>
 
