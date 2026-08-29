@@ -1,4 +1,4 @@
-<!-- RVTools Analyzer v5.8 · Built 2026-08-28 04:25 · © Shaun Jacob -->
+<!-- RVTools Analyzer v5.8 · Built 2026-08-29 10:37 · © Shaun Jacob -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -476,6 +476,48 @@
     rename,
     storageEstimate,
   };
+});
+</script>
+  <script>/* assets/telemetry.js */
+// Privacy-preserving telemetry helpers for assessment lifecycle actions.
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.rvTelemetry = api;
+})(typeof window !== 'undefined' ? window : globalThis, function (root) {
+  'use strict';
+
+  function projectCounts(project) {
+    const workbooks = Array.isArray(project && project.workbooks) ? project.workbooks : [];
+    return {
+      sourceCount: workbooks.length,
+      vmCount: workbooks.reduce((sum, workbook) => sum + ((((workbook || {}).tabs || {}).vInfo || []).length), 0),
+    };
+  }
+
+  function trackAssessmentAction(action, storage, options = {}) {
+    try {
+      if (!root.appInsights || typeof root.appInsights.trackEvent !== 'function') return;
+      const counts = projectCounts(options.project);
+      const versionMeta = root.document && root.document.querySelector
+        ? root.document.querySelector('meta[name="app-version"]')
+        : null;
+      const properties = {
+        action: String(action || 'unknown'),
+        storage: String(storage || 'unknown'),
+        saveMode: String(options.saveMode || ''),
+        appVersion: versionMeta ? versionMeta.content : '',
+        sourceCount: Number.isFinite(options.sourceCount) ? options.sourceCount : counts.sourceCount,
+        vmCount: Number.isFinite(options.vmCount) ? options.vmCount : counts.vmCount,
+      };
+      if (Number.isFinite(options.savedAssessmentCount)) {
+        properties.savedAssessmentCount = options.savedAssessmentCount;
+      }
+      root.appInsights.trackEvent({ name: 'assessment_action' }, properties);
+    } catch (_) { /* telemetry failure must never break the app */ }
+  }
+
+  return { projectCounts, trackAssessmentAction };
 });
 </script>
 
@@ -22271,12 +22313,15 @@ window.rvApp = function () {
       return `Saved ${this.formatProjectDate(this.projectSavedAt)}`;
     },
 
-    openProjects() {
+    async openProjects() {
       this.projectName = this.projectName || this.defaultProjectName();
       this.projectError = '';
       this.projectNotice = '';
       this.projectsOpen = true;
-      this.refreshProjectLibrary();
+      await this.refreshProjectLibrary();
+      window.rvTelemetry?.trackAssessmentAction('library_opened', 'browser', {
+        savedAssessmentCount: this.projectLibrary.length,
+      });
     },
 
     async refreshProjectLibrary() {
@@ -22323,6 +22368,7 @@ window.rvApp = function () {
         await window.rvProjects.downloadProject(project);
         if (this.projectSource !== 'browser') this.acceptSavedProject(project, 'file');
         this.projectNotice = 'Downloaded updated project file';
+        window.rvTelemetry?.trackAssessmentAction('saved', 'file', { project, saveMode: 'download' });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22335,11 +22381,17 @@ window.rvApp = function () {
       this.projectError = '';
       this.projectNotice = '';
       try {
-        const project = this.captureProject({ freshId: this.projectSource !== 'browser' });
+        const saveMode = this.projectSource === 'browser' ? 'update' : 'new';
+        const project = this.captureProject({ freshId: saveMode === 'new' });
         await window.rvProjects.save(project);
         this.acceptSavedProject(project, 'browser');
         this.projectNotice = 'Saved to this browser';
         await this.refreshProjectLibrary();
+        window.rvTelemetry?.trackAssessmentAction('saved', 'browser', {
+          project,
+          saveMode,
+          savedAssessmentCount: this.projectLibrary.length,
+        });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22357,6 +22409,11 @@ window.rvApp = function () {
         this.acceptSavedProject(project, 'browser');
         this.projectNotice = 'Saved as a new browser assessment';
         await this.refreshProjectLibrary();
+        window.rvTelemetry?.trackAssessmentAction('saved', 'browser', {
+          project,
+          saveMode: 'copy',
+          savedAssessmentCount: this.projectLibrary.length,
+        });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22408,6 +22465,11 @@ window.rvApp = function () {
           this.projectDirty = true;
         }
         await this.refreshProjectLibrary();
+        window.rvTelemetry?.trackAssessmentAction('deleted', 'browser', {
+          sourceCount: project.sourceCount,
+          vmCount: project.vmCount,
+          savedAssessmentCount: this.projectLibrary.length,
+        });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22421,6 +22483,7 @@ window.rvApp = function () {
       try {
         const project = await window.rvProjects.load(id);
         await window.rvProjects.downloadProject(project);
+        window.rvTelemetry?.trackAssessmentAction('exported', 'file', { project });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22439,6 +22502,10 @@ window.rvApp = function () {
           this.projectSavedAt = renamed.metadata.updatedAt;
         }
         await this.refreshProjectLibrary();
+        window.rvTelemetry?.trackAssessmentAction('renamed', 'browser', {
+          project: renamed,
+          savedAssessmentCount: this.projectLibrary.length,
+        });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22449,8 +22516,12 @@ window.rvApp = function () {
     async duplicateBrowserProject(project) {
       this.projectBusy = true;
       try {
-        await window.rvProjects.duplicate(project.id);
+        const copy = await window.rvProjects.duplicate(project.id);
         await this.refreshProjectLibrary();
+        window.rvTelemetry?.trackAssessmentAction('duplicated', 'browser', {
+          project: copy,
+          savedAssessmentCount: this.projectLibrary.length,
+        });
       } catch (error) {
         this.projectError = error.message || String(error);
       } finally {
@@ -22509,6 +22580,10 @@ window.rvApp = function () {
           renderAll(this.results);
           this.acceptSavedProject(project, source);
           this.projectRestoring = false;
+          window.rvTelemetry?.trackAssessmentAction('opened', source, {
+            project,
+            savedAssessmentCount: source === 'browser' ? this.projectLibrary.length : undefined,
+          });
         });
         return true;
       } catch (error) {

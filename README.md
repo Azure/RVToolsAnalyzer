@@ -18,7 +18,7 @@ browser or serve it from any static host. **No data ever leaves your browser.**
 ## Current build
 
 - **Version**: `vundefined`
-- **Last published**: 2026-08-28 04:26 UTC
+- **Last published**: 2026-08-29 10:37 UTC
 - **Source**: built and published automatically from
   [shaunjacob/RVTools-Analyzer](https://github.com/shaunjacob/RVTools-Analyzer)
 
